@@ -250,3 +250,81 @@ def train_model(
     )
 
     return model, df_coefficients, x_test, y_test
+
+
+def predict_models_on_data(
+    reg_model: LinearRegression,
+    clf_model: LogisticRegression,
+    x_test: pd.DataFrame,
+    y_test: pd.DataFrame,
+    features: List[str],
+    parameters: Dict,
+):
+    classification_threshold = parameters["classification_threshold"]
+    regression_threshold = parameters["regression_threshold"]
+    x_test = x_test.loc[:, features].copy()
+    prob_prediction = clf_model.predict_proba(x_test)[:, 1]
+    classification_prediction = (prob_prediction > classification_threshold).astype(int)
+    rating_prediction = reg_model.predict(x_test)
+    x_test.loc[:, "clf_prob_prediction"] = prob_prediction
+    x_test.loc[:, "reg_rating_prediction"] = rating_prediction
+    regression_prediction = (rating_prediction >= regression_threshold).astype(int)
+    x_test.loc[:, "regression_prediction"] = regression_prediction
+    x_test.loc[:, "classification_prediction"] = classification_prediction
+    print(x_test[["reg_rating_prediction", "clf_prob_prediction"]].describe())
+    # merge together with y_text and return
+    df_predict_test = x_test.join(y_test)
+    assert all(df_predict_test.isna().sum() == 0)
+    # check if predictions are the same
+    print(
+        "Regression and classification predictions the same?",
+        df_predict_test["regression_prediction"].equals(
+            df_predict_test["classification_prediction"]
+        ),
+    )
+    print(
+        "Balanced accuracy for regression: ",
+        balanced_accuracy_score(
+            df_predict_test["avg_vote_flag"], df_predict_test["regression_prediction"]
+        ),
+    )
+    print(
+        "Balanced accuracy for classification: ",
+        balanced_accuracy_score(
+            df_predict_test["avg_vote_flag"],
+            df_predict_test["classification_prediction"],
+        ),
+    )
+    return df_predict_test
+
+
+def compare_methods(
+    df_model: pd.DataFrame,
+    reg_model: LinearRegression,
+    clf_model: LogisticRegression,
+    x_test: pd.DataFrame,
+    y_test: pd.DataFrame,
+    train_movies_sample: Set,
+    parameters: Dict,
+):
+    target_columns = parameters["target_columns"]
+    idx_columns = parameters["idx_columns"]
+    features = list(set(df_model.columns) - set(target_columns).union(idx_columns))
+
+    # make predictions on test data
+    print("Making predictions on test data")
+    df_predict_test = predict_models_on_data(
+        reg_model, clf_model, clf_x_test, y_test, features, parameters
+    )
+    
+    # make predictions on train data -- movies I know where we can identify gaps...
+    x_train = df_model.loc[df_model.title.isin(train_movies_sample), features].copy()
+    y_train = df_model.loc[
+        df_model.title.isin(train_movies_sample), y_test.columns
+    ].copy()
+    print("Making predictions on sample data from train data")
+    df_predict_train = predict_models_on_data(
+        reg_model, clf_model, x_train, y_train, features, parameters
+    )
+
+    return df_predict_test, df_predict_train
