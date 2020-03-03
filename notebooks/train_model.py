@@ -5,6 +5,8 @@ from sklearn.linear_model import LogisticRegression, LinearRegression, LogisticR
 from yellowbrick.classifier import DiscriminationThreshold
 from yellowbrick.regressor import ResidualsPlot
 from sklearn.model_selection import train_test_split, StratifiedShuffleSplit, ShuffleSplit
+from collections import defaultdict
+from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score, roc_curve, precision_recall_curve, balanced_accuracy_score
 import time, datetime
@@ -229,6 +231,8 @@ def train_model(
     """
     # collect parameters
     model_type = parameters["model_type"]
+    plot_write_dir = parameters["plot_write_dir"]
+    model_save_dir = parameters["model_save_dir"]
     assert model_type in ["regression", "classification"]
     if load_from_disk:
         assert model_type in load_from_disk
@@ -328,3 +332,140 @@ def compare_methods(
     )
 
     return df_predict_test, df_predict_train
+
+
+def prepare_data_for_sklearn(
+    df: pd.DataFrame, dummy_encoding: bool, target_variable: str, idx_columns: List[str]
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Apply scaling/encoding to numeric and categorical variables
+
+
+    Returns:
+        A pd.DataFrame, ready to pass to modeling as is.
+    """
+
+    # drop key columns and target variable
+    X, y = (df.drop(columns=idx_columns + [target_variable]), df[target_variable])
+
+    # determine column types so appropriate transformation is applied
+    col2type = {col: typ.name for col, typ in X.dtypes.iteritems()}
+    type2cols = defaultdict(list)
+    for k, v in col2type.items():
+        if v == "object":
+            type2cols["string"].append(k)
+        else:
+            type2cols["numeric"].append(k)
+
+    # categorical variables
+
+    string_cols = type2cols.get("string")
+    if dummy_encoding and string_cols:
+        cat_features = pd.get_dummies(
+            X[string_cols], columns=string_cols, drop_first=True
+        )
+        X = X.drop(columns=string_cols)  # drop original categorical column
+        assert len(X.index) == len(cat_features)
+        X = pd.concat([X, cat_features], axis=1)
+
+    # numeric columns
+
+    numeric_cols = type2cols.get("numeric")
+    standard_scaler = StandardScaler()
+    scaled_features = X.loc[:, numeric_cols].copy()
+    scaled_X = standard_scaler.fit_transform(scaled_features.values)
+    scaled_df = X.copy()
+    scaled_df.loc[:, numeric_cols] = scaled_X
+
+    # add key columns back to scaled_df...
+    scaled_df = scaled_df.merge(y, left_index=True, right_index=True).merge(
+        df[idx_columns], left_index=True, right_index=True
+    )
+
+    unscaled_df = X.merge(y, left_index=True, right_index=True).merge(
+        df[idx_columns], left_index=True, right_index=True
+    )
+
+    return scaled_df, unscaled_df
+
+def enrich_data_with_movies_features(
+    df: pd.DataFrame, idx_columns: List[str], target_columns: List[str], dummy: bool
+) -> pd.DataFrame:
+    if not dummy:
+        df.loc[:, "primary_country"] = df.country.str.split(",").apply(
+            lambda s: s[0] if isinstance(s, list) else s
+        )
+        df.loc[:, "primary_country"] = df.primary_country.fillna(
+            "not_available"
+        )
+
+        df.loc[:, "primary_language"] = df.language.str.split(",").apply(
+            lambda s: s[0] if isinstance(s, list) else s
+        )
+        df.loc[:, "primary_language"] = df.primary_language.fillna(
+            "not_available"
+        )
+        df.loc[:, "primary_genre"] = df.genre.str.split(",").apply(
+            lambda s: s[0] if isinstance(s, list) else s
+        )
+
+        df.loc[:, "global"] = df.apply(global_movie, axis="columns")
+        df.loc[:, "vote_popularity"] = (
+            pd.qcut(df.votes, q=4)
+            .cat.rename_categories(
+                ["low_q25", "low_mid_q50", "mid_high_q75", "high_q99"]
+            )
+            .astype(str)
+        )
+
+        cols2keep = [
+            "year",
+            "duration",
+            "reviews_from_users",
+            "reviews_from_critics",
+            "primary_country",
+            "primary_language",
+            "primary_genre",
+            "global",
+            "vote_popularity",
+        ]
+    else:
+        cols2keep = ["year", "duration"]
+    select = idx_columns + cols2keep + target_columns
+
+    return df.loc[:, select].copy()
+
+def collapse_categorical_variable(df: pd.DataFrame, column: str, percentage_cutoff: float = 80.0) -> pd.DataFrame:
+    
+    assert sum(df[column].isna()) == 0
+    proportion = (
+    df_movies[column].value_counts().sort_values(ascending=False).reset_index()
+    )
+    proportion.loc[:, "cumpercentage"] = (
+        proportion[column].cumsum()
+        / proportion[column].sum()
+        * 100
+    )
+    values_to_consider = proportion.loc[proportion["cumpercentage"] < percentage_cutoff,
+                                                     "index"].to_list()
+    df.loc[~df[column].isin(values_to_consider), column] = "other"
+    print(df[column].value_counts())
+    return df
+
+
+def global_movie(row):
+    def is_non_us_grossing_movie(row):
+        return ((pd.notnull(row["usa_gross_income"])) & (row["primary_country"] != "USA"))
+
+    def is_worldwide_grossing_movie(row):
+        return True if isinstance(row["worlwide_gross_income"], str) else False
+
+    def is_released_in_multiple_locations(row):
+        return "," in row["country"] if isinstance(row["country"], str) else False
+
+    flag = (
+        (is_non_us_grossing_movie(row))
+        | (is_worldwide_grossing_movie(row))
+        | (is_released_in_multiple_locations(row))
+    )
+    return flag
