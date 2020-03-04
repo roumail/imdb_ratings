@@ -1,14 +1,28 @@
 import os
 import pandas as pd
 from typing import Tuple, Dict, List, Optional, Union, Set
-from sklearn.linear_model import LogisticRegression, LinearRegression, LogisticRegressionCV
+from sklearn.linear_model import (
+    LogisticRegression,
+    LinearRegression,
+    LogisticRegressionCV,
+)
 from yellowbrick.classifier import DiscriminationThreshold
 from yellowbrick.regressor import ResidualsPlot
-from sklearn.model_selection import train_test_split, StratifiedShuffleSplit, ShuffleSplit
+from sklearn.model_selection import (
+    train_test_split,
+    StratifiedKFold,
+    ShuffleSplit,
+    cross_val_predict,
+)
 from collections import defaultdict
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
-from sklearn.metrics import roc_auc_score, roc_curve, precision_recall_curve, balanced_accuracy_score
+from sklearn.metrics import (
+    roc_auc_score,
+    roc_curve,
+    precision_recall_curve,
+    balanced_accuracy_score,
+)
 import time, datetime
 import numpy as np
 import joblib
@@ -16,7 +30,7 @@ import warnings
 
 
 def summarise_classifier_performance(
-    model: LogisticRegression,
+    model: Union[LogisticRegression, LogisticRegressionCV],
     x_train: pd.DataFrame,
     y_train: pd.DataFrame,
     x_test: pd.DataFrame,
@@ -83,7 +97,7 @@ def plot_roc_curve(fpr: np.array, tpr: np.array, label=None) -> plt.Figure:
 
 
 def get_model_coefficients(
-    model: Union[LogisticRegression, LinearRegression], features: pd.DataFrame
+    model: Union[LogisticRegressionCV, LinearRegression], features: pd.DataFrame
 ) -> pd.DataFrame:
     """
     Retrieve model coefficients
@@ -109,6 +123,52 @@ def get_model_coefficients(
     return df_coefs.reset_index()
 
 
+def _plot_precision_recall(precisions, recalls, thresholds, ax, plot_write_dir):
+    def frange(start, stop, step):
+        i = start
+        while i < stop:
+            yield np.round(float(i), 3)
+            i += step
+
+    # Ensure thresholds ends at 1
+    thresholds = np.append(thresholds, 1)
+    threshold_fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+
+    ax.plot(thresholds, precisions, color="blue", label="precisions")
+    ax.plot(thresholds, recalls, color="red", label="recalls")
+    idx = np.argwhere(np.diff(np.sign(precisions - recalls))).flatten()
+    optimum_threshold = thresholds[idx]
+    if (len(optimum_threshold) > 1) and (
+        np.allclose(optimum_threshold, optimum_threshold[0], atol=1e-1)
+    ):
+        optimum_threshold = optimum_threshold[0]
+        idx = idx[:1]
+    ax.set_xticks(list(frange(0, 1, 0.1)))
+    print("optimal threshold: ", optimum_threshold.round(3))
+    ax.plot(optimum_threshold, precisions[idx], "ro")
+    ax.legend()
+    threshold_fig.savefig(
+        os.path.join(plot_write_dir, "classification_threshold_fig.png")
+    )
+    return optimum_threshold
+
+
+def optimize_decision_threshold(
+    model: Union[LogisticRegression, LogisticRegressionCV],
+    x_train: pd.DataFrame,
+    y_train: pd.DataFrame,
+    cv: StratifiedKFold,
+    plot_write_dir: str,
+):
+    y_scores = cross_val_predict(model, x_train, y_train, cv=cv, method="predict_proba")
+
+    precisions, recalls, thresholds = precision_recall_curve(y_train, y_scores[:, 1])
+    optimum_threshold = _plot_precision_recall(
+        precisions, recalls, thresholds, ax, plot_write_dir
+    )
+    return optimum_threshold
+
+
 def fit_model(
     X: pd.DataFrame,
     y: pd.Series,
@@ -123,7 +183,7 @@ def fit_model(
     model_save_dir = parameters["model_save_dir"]
     idx_columns = parameters["idx_columns"]
 
-    plot_write_dir = parameters.get("plot_write_dir") 
+    plot_write_dir = parameters.get("plot_write_dir")
 
     if model_type == "regression":
         x_train, x_test, y_train, y_test = train_test_split(
@@ -135,8 +195,7 @@ def fit_model(
         x_train, x_test, y_train, y_test = train_test_split(
             X, y, test_size=test_set_size, stratify=y, random_state=123
         )
-
-        cv = StratifiedShuffleSplit(n_splits=5, random_state=0)
+        cv = StratifiedKFold(n_splits=5, random_state=0, shuffle=True)
         cv.get_n_splits(x_train, y_train)
 
     # Create lookup between index and train to retrieve idx columns for y_test ....
@@ -159,22 +218,21 @@ def fit_model(
     start = time.time()
     if model_type == "classification":
         fit_params = parameters["training_parameters"]
-        model = LogisticRegression(verbose=0, penalty="l2", random_state=123)
-        # Select optimum threshold
-        # Queue rate: This metric describes the percentage of instances that must be reviewed. If review has a high cost
-        # (e.g. fraud prevention) then this must be minimized with respect to business requirements; if it doesn’t
-        # (e.g. spam filter), this could be optimized to ensure the inbox stays clean.
-        # we want this rate to be low, since we don't want to miss high rated target even if we create false positives..
-        threshold_fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-        with warnings.catch_warnings():
-            warnings.simplefilter(action="ignore", category=FutureWarning)
-            visualizer = DiscriminationThreshold(model, ax=ax, is_fitted=False, cv=cv)
-            visualizer.fit(x_train, y_train, n_trials=1, **fit_params)
-            visualizer.finalize()
-            threshold_fig.savefig(
-                os.path.join(plot_write_dir, f"{model_type}_threshold_fig.png")
-            )
+        # train a logistic regression model
+        #         model = LogisticRegression(verbose=0, penalty="l2", random_state=123)
+        model = LogisticRegressionCV(**fit_params, verbose=0, cv=cv, random_state=123)
 
+        # NB: max_iter should be increased, because the current value 300 is often reached:
+        # it suggests that fitting stops before convergence.
+        model.fit(x_train, y_train)
+        print("classification model has been fit.. Determining optimum threshold")
+
+        # optimize the decision threshold
+        optimum_threshold = optimize_decision_threshold(
+            model, x_train, y_train, cv, plot_write_dir
+        )
+
+        # summarize classifier performance
         roc_fig = summarise_classifier_performance(
             model, x_train, y_train, x_test, y_test
         )
@@ -203,19 +261,14 @@ def fit_model(
     y_test = idx2lookup_cols.join(y_test)
     assert all(y_test.isna().sum() == 0)
 
-    return (
-        model,
-        df_coefficients,
-        x_test,
-        y_test,
-    )
+    return (model, df_coefficients, x_test, y_test)
 
 
 def train_model(
     df_model: pd.DataFrame, parameters: Dict, load_from_disk: Optional[str] = None
-) -> Tuple[LogisticRegression, pd.DataFrame]:
+) -> Tuple[Union[LogisticRegression, LogisticRegressionCV], pd.DataFrame]:
     """
-    This function fits either a LogisticRegression or LinearRegression model from sklearn and returns the trained model
+    This function fits either a LogisticRegression or LinearRegressionCV model from sklearn and returns the trained model
     and fitted coefficients to be visualized in a feature importance plot
 
     Args:
@@ -258,7 +311,7 @@ def train_model(
 
 def predict_models_on_data(
     reg_model: LinearRegression,
-    clf_model: LogisticRegression,
+    clf_model: Union[LogisticRegression, LogisticRegressionCV],
     x_test: pd.DataFrame,
     y_test: pd.DataFrame,
     features: List[str],
@@ -305,7 +358,7 @@ def predict_models_on_data(
 def compare_methods(
     df_model: pd.DataFrame,
     reg_model: LinearRegression,
-    clf_model: LogisticRegression,
+    clf_model: Union[LogisticRegressionCV, LogisticRegression],
     x_test: pd.DataFrame,
     y_test: pd.DataFrame,
     train_movies_sample: Set,
@@ -320,7 +373,7 @@ def compare_methods(
     df_predict_test = predict_models_on_data(
         reg_model, clf_model, clf_x_test, y_test, features, parameters
     )
-    
+
     # make predictions on train data -- movies I know where we can identify gaps...
     x_train = df_model.loc[df_model.title.isin(train_movies_sample), features].copy()
     y_train = df_model.loc[
@@ -388,6 +441,7 @@ def prepare_data_for_sklearn(
 
     return scaled_df, unscaled_df
 
+
 def enrich_data_with_movies_features(
     df: pd.DataFrame, idx_columns: List[str], target_columns: List[str], dummy: bool
 ) -> pd.DataFrame:
@@ -395,16 +449,12 @@ def enrich_data_with_movies_features(
         df.loc[:, "primary_country"] = df.country.str.split(",").apply(
             lambda s: s[0] if isinstance(s, list) else s
         )
-        df.loc[:, "primary_country"] = df.primary_country.fillna(
-            "not_available"
-        )
+        df.loc[:, "primary_country"] = df.primary_country.fillna("not_available")
 
         df.loc[:, "primary_language"] = df.language.str.split(",").apply(
             lambda s: s[0] if isinstance(s, list) else s
         )
-        df.loc[:, "primary_language"] = df.primary_language.fillna(
-            "not_available"
-        )
+        df.loc[:, "primary_language"] = df.primary_language.fillna("not_available")
         df.loc[:, "primary_genre"] = df.genre.str.split(",").apply(
             lambda s: s[0] if isinstance(s, list) else s
         )
@@ -435,19 +485,21 @@ def enrich_data_with_movies_features(
 
     return df.loc[:, select].copy()
 
-def collapse_categorical_variable(df: pd.DataFrame, column: str, percentage_cutoff: float = 80.0) -> pd.DataFrame:
-    
+
+def collapse_categorical_variable(
+    df: pd.DataFrame, column: str, percentage_cutoff: float = 80.0
+) -> pd.DataFrame:
+
     assert sum(df[column].isna()) == 0
     proportion = (
-    df_movies[column].value_counts().sort_values(ascending=False).reset_index()
+        df_movies[column].value_counts().sort_values(ascending=False).reset_index()
     )
     proportion.loc[:, "cumpercentage"] = (
-        proportion[column].cumsum()
-        / proportion[column].sum()
-        * 100
+        proportion[column].cumsum() / proportion[column].sum() * 100
     )
-    values_to_consider = proportion.loc[proportion["cumpercentage"] < percentage_cutoff,
-                                                     "index"].to_list()
+    values_to_consider = proportion.loc[
+        proportion["cumpercentage"] < percentage_cutoff, "index"
+    ].to_list()
     df.loc[~df[column].isin(values_to_consider), column] = "other"
     print(df[column].value_counts())
     return df
@@ -455,7 +507,7 @@ def collapse_categorical_variable(df: pd.DataFrame, column: str, percentage_cuto
 
 def global_movie(row):
     def is_non_us_grossing_movie(row):
-        return ((pd.notnull(row["usa_gross_income"])) & (row["primary_country"] != "USA"))
+        return (pd.notnull(row["usa_gross_income"])) & (row["primary_country"] != "USA")
 
     def is_worldwide_grossing_movie(row):
         return True if isinstance(row["worlwide_gross_income"], str) else False
