@@ -90,6 +90,5 @@ target/
 
 # model directory
 models/
-
-# reports/figures
-reports/figures/
+!models/classification_2020_03_04_15_57.joblib
+!models/regression_2020_03_04_15_14.joblib
