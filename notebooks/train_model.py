@@ -123,7 +123,7 @@ def get_model_coefficients(
     return df_coefs.reset_index()
 
 
-def _plot_precision_recall(precisions, recalls, thresholds, ax, plot_write_dir):
+def _plot_precision_recall(precisions, recalls, thresholds, plot_write_dir):
     def frange(start, stop, step):
         i = start
         while i < stop:
@@ -164,7 +164,7 @@ def optimize_decision_threshold(
 
     precisions, recalls, thresholds = precision_recall_curve(y_train, y_scores[:, 1])
     optimum_threshold = _plot_precision_recall(
-        precisions, recalls, thresholds, ax, plot_write_dir
+        precisions, recalls, thresholds, plot_write_dir
     )
     return optimum_threshold
 
@@ -371,7 +371,7 @@ def compare_methods(
     # make predictions on test data
     print("Making predictions on test data")
     df_predict_test = predict_models_on_data(
-        reg_model, clf_model, clf_x_test, y_test, features, parameters
+        reg_model, clf_model, x_test, y_test, features, parameters
     )
 
     # make predictions on train data -- movies I know where we can identify gaps...
@@ -455,9 +455,10 @@ def enrich_data_with_movies_features(
             lambda s: s[0] if isinstance(s, list) else s
         )
         df.loc[:, "primary_language"] = df.primary_language.fillna("not_available")
-        df.loc[:, "primary_genre"] = df.genre.str.split(",").apply(
-            lambda s: s[0] if isinstance(s, list) else s
-        )
+        # leads to too many categorical variables...
+#         df.loc[:, "primary_genre"] = df.genre.str.split(",").apply(
+#             lambda s: s[0] if isinstance(s, list) else s
+#         )
 
         df.loc[:, "global"] = df.apply(global_movie, axis="columns")
         df.loc[:, "vote_popularity"] = (
@@ -475,7 +476,7 @@ def enrich_data_with_movies_features(
             "reviews_from_critics",
             "primary_country",
             "primary_language",
-            "primary_genre",
+#             "primary_genre",
             "global",
             "vote_popularity",
         ]
